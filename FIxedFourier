@@ -11,15 +11,14 @@ from torchvision import transforms, datasets
 from torch.utils.data import Dataset, DataLoader, random_split
 
 # ------------------------------ CONFIG ------------------------------
-# Point this to your IllusionAnimals dataset root (class-subfolders inside).
-# This code safely ignores hidden dirs like ".git".
+
 DATA_SRC = "/content/drive/MyDrive/IllusionAnimals_train"   # <-- change if needed
 
 # Where to store per-image HP maps (flattened 14x14 -> 196 floats)
 HP_DIR   = "/content/IllusionAnimals_hp"
 os.makedirs(HP_DIR, exist_ok=True)
 
-# HP + guidance params (Option A)
+# HP + guidance params 
 R_HP          = 50          # high-pass radius (pixels)
 HP_EPS        = 1e-8        # numerical stability
 ALPHA_TOPK    = 0.5         # HP bias strength in sibling top-k (0=no effect)
@@ -30,7 +29,7 @@ BATCH_SIZE = 32
 EPOCHS     = 10
 LR         = 3e-4
 VAL_PCT    = 0.2
-NUM_WORKERS = 4  # If Colab Free gets sad, set 2
+NUM_WORKERS = 4  
 
 # Logging
 LOG_TRAIN_EVERY = 10  # print batch metrics every N batches
@@ -399,7 +398,7 @@ _ = model_qt(xb.to(device), list(stems))
 _ = model_vit(xb.to(device), list(stems))
 print(f"[Warmup] OK. {gpu_mem()}")
 
-# ------------------------------ TRAIN --------------------------------
+# Train
 total_start = time.time()
 for model, opt, name in [(model_qt, opt_qt, 'MX-CiF-QT+HP'),
                          (model_vit, opt_vit, 'Baseline-ViT')]:
