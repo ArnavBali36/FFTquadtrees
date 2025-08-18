@@ -1,0 +1,423 @@
+# === ONE-CELL PIPELINE (Option A + robust loader that ignores .git) ===
+import os, math, time, gc, sys
+import torch
+import torch.nn as nn
+import timm
+import cv2
+import numpy as np
+from pathlib import Path
+from PIL import Image
+from torchvision import transforms, datasets
+from torch.utils.data import Dataset, DataLoader, random_split
+
+# ------------------------------ CONFIG ------------------------------
+# Point this to your IllusionAnimals dataset root (class-subfolders inside).
+# This code safely ignores hidden dirs like ".git".
+DATA_SRC = "/content/drive/MyDrive/IllusionAnimals_train"   # <-- change if needed
+
+# Where to store per-image HP maps (flattened 14x14 -> 196 floats)
+HP_DIR   = "/content/IllusionAnimals_hp"
+os.makedirs(HP_DIR, exist_ok=True)
+
+# HP + guidance params (Option A)
+R_HP          = 50          # high-pass radius (pixels)
+HP_EPS        = 1e-8        # numerical stability
+ALPHA_TOPK    = 0.5         # HP bias strength in sibling top-k (0=no effect)
+BETA_POOL     = 0.5         # HP bias in final parent-group pooling (0=no effect)
+
+# Training params (match your earlier schedule)
+BATCH_SIZE = 32
+EPOCHS     = 10
+LR         = 3e-4
+VAL_PCT    = 0.2
+NUM_WORKERS = 4  # If Colab Free gets sad, set 2
+
+# Logging
+LOG_TRAIN_EVERY = 10  # print batch metrics every N batches
+
+# ------------------------- UTIL: device + mem ------------------------
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def gpu_mem():
+    if torch.cuda.is_available():
+        return f"GPU mem: {torch.cuda.memory_allocated()/1e6:.1f}MB / {torch.cuda.memory_reserved()/1e6:.1f}MB"
+    return "CPU"
+
+print(f"[Setup] Device: {device} | {gpu_mem()}")
+print(f"[Paths] DATA_SRC={DATA_SRC} | HP_DIR={HP_DIR}")
+
+# --------------------- PRECOMPUTE: HP maps (14x14) -------------------
+def highpass_mag_224(gray_224, r_hp):
+    # FFT high-pass magnitude in [0,1]
+    fshift = np.fft.fftshift(np.fft.fft2(gray_224))
+    h, w = gray_224.shape
+    cy, cx = h//2, w//2
+    Y, X = np.ogrid[:h, :w]
+    mask = ((Y - cy)**2 + (X - cx)**2) > (r_hp**2)
+    recon = np.fft.ifft2(np.fft.ifftshift(fshift * mask))
+    mag = np.abs(recon)
+    mag -= mag.min()
+    mag /= (mag.max() + HP_EPS)
+    return mag  # float64 [0..1]
+
+def hp_to_patch_map_14x14(hp224):
+    # Average over each 16x16 patch region to align with ViT patching
+    # reshape (224,224) -> (14,16,14,16) and mean over (1,3) -> (14,14)
+    H, W = hp224.shape
+    assert H == 224 and W == 224, "HP map must be 224x224"
+    hp = hp224.reshape(14,16,14,16).mean(axis=(1,3))  # (14,14)
+    return hp
+
+def list_image_paths(root):
+    root = Path(root)
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+    return sorted([p for p in root.rglob("*") if p.suffix.lower() in exts])
+
+def ensure_hp_maps_for_dataset(data_root):
+    imgs = list_image_paths(data_root)
+    if not imgs:
+        raise RuntimeError(f"No images found under {data_root}")
+    t0 = time.time()
+    wrote = 0
+    for i, p in enumerate(imgs, 1):
+        outp = Path(HP_DIR) / f"{p.stem}.pt"
+        if outp.exists():  # skip if already computed
+            continue
+        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            print(f"[HP][WARN] Could not read {p}; skipping.")
+            continue
+        gray = cv2.resize(gray, (224,224), interpolation=cv2.INTER_AREA)
+        hp224 = highpass_mag_224(gray, R_HP)
+        hp14  = hp_to_patch_map_14x14(hp224)     # (14,14), 0..1
+        hp196 = torch.from_numpy(hp14.astype(np.float32)).reshape(-1)  # (196,)
+        torch.save(hp196, outp)
+        wrote += 1
+        if i % 200 == 0 or i == len(imgs):
+            print(f"[HP] {i}/{len(imgs)} processed | wrote={wrote} | {gpu_mem()}")
+    print(f"[HP] Done in {time.time()-t0:.1f}s | new maps: {wrote} | dir={HP_DIR}")
+
+# Precompute HP maps (only missing files)
+try:
+    if Path(DATA_SRC).exists() and Path(DATA_SRC).is_dir():
+        ensure_hp_maps_for_dataset(DATA_SRC)
+    else:
+        raise RuntimeError("DATA_SRC is not a local directory with class subfolders.")
+except Exception as e:
+    print(f"[HP][WARN] {e}")
+
+# ---------------------- DATA: Clean loader (ignores .git) ---------------------
+from torchvision.datasets import ImageFolder
+
+class CleanImageFolder(ImageFolder):
+    """
+    Same as torchvision.datasets.ImageFolder, but:
+      - Skips hidden directories (name starts with '.'): e.g., '.git'
+      - Leaves everything else identical
+    """
+    def find_classes(self, directory: str):
+        # Copy of ImageFolder.find_classes with hidden-dir filter
+        # (Torch's original sorts dirs; we do the same.)
+        classes = []
+        class_to_idx = {}
+        for entry in os.scandir(directory):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name.startswith('.'):
+                continue  # skip .git, .ipynb_checkpoints, etc.
+            classes.append(name)
+        classes.sort()
+        if not classes:
+            raise FileNotFoundError(f"No valid class folders found under: {directory}")
+        class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
+
+class ImageFolderWithStem(Dataset):
+    """
+    Wrap CleanImageFolder but also return file stem for per-image HP map.
+    """
+    def __init__(self, root, transform=None):
+        base = CleanImageFolder(root=root, transform=transform)
+        # Filter to keep only supported image extensions (defensive)
+        exts = (".jpg",".jpeg",".png",".bmp",".tif",".tiff",".webp")
+        base.samples = [(p, y) for (p, y) in base.samples if Path(p).suffix.lower() in exts]
+        self.base = base
+        self.samples = self.base.samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        stem = Path(path).stem
+        return img, label, stem
+
+def build_dataloaders_on_the_fly(path, bs=BATCH_SIZE, val_pct=VAL_PCT):
+    tf = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,)*3,(0.5,)*3),
+    ])
+    full_ds = ImageFolderWithStem(path, transform=tf)
+    n_val = int(len(full_ds) * val_pct)
+    n_train = len(full_ds) - n_val
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+    train_dl = DataLoader(train_ds, batch_size=bs, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=bs, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    print(f"[Loader] ImageFolder | classes={len(full_ds.base.classes)} -> {full_ds.base.classes}")
+    print(f"[Loader] train={len(train_ds)} | val={len(val_ds)} | batch_size={bs}")
+    return train_dl, val_dl
+
+# ------------------------------ Fixed quadtree buffers ---------------------------
+def build_sibling_buffers(H: int, W: int):
+    # exact replica of your friend's grouping: uniform 2x2 pyramid over HxW grid
+    levels, h, w = [], H, W
+    while h > 1 and w > 1:
+        nH, nW = h//2, w//2
+        groups = [[(2*i+dr)*w + (2*j+dc)
+                    for dr in (0,1) for dc in (0,1)]
+                   for i in range(nH) for j in range(nW)]
+        levels.append(torch.tensor(groups, dtype=torch.long))  # [n,4]
+        h, w = nH, nW
+    L = len(levels)
+    Nmax = max(buf.size(0) for buf in levels)
+    idxbuf = torch.full((L, Nmax, 4), -1, dtype=torch.long)
+    mskbuf = torch.zeros((L, Nmax), dtype=torch.bool)
+    for i, buf in enumerate(levels):
+        idxbuf[i, :buf.size(0)] = buf
+        mskbuf[i, :buf.size(0)] = 1
+    return idxbuf, mskbuf  # shapes: [L, Nmax, 4], [L, Nmax]
+
+# ------------------------ MODEL: Sibling attention (HP-guided) -------------------
+class MxCIFSiblingAttentionHP(nn.Module):
+    """
+    Same as MxCIFSiblingAttention, but saliency is biased by per-child HP scores.
+    sal = ||q|| (mean over heads) + ALPHA_TOPK * hp_child
+    """
+    def __init__(self, d_model:int, n_heads:int, k_keep:int=2, alpha_topk:float=0.5):
+        super().__init__()
+        self.n_heads = n_heads
+        self.dh      = d_model // n_heads
+        self.k       = k_keep
+        self.alpha   = alpha_topk
+        self.qkv      = nn.Linear(d_model, 3*d_model, bias=False)
+        self.proj     = nn.Linear(d_model, d_model, bias=False)
+        self.cif_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x_grp: torch.Tensor, hp_child: torch.Tensor):
+        """
+        x_grp:   [B, N, 4, D]
+        hp_child:[B, N, 4]   (values in [0,1])
+        """
+        B, N, C, D = x_grp.shape
+        H, dh = self.n_heads, self.dh
+
+        qkv = self.qkv(x_grp.reshape(-1, D)).view(B, N, C, 3, H, dh)
+        q, k, v = qkv.unbind(dim=3)  # each [B,N,4,H,dh]
+
+        # base saliency from q
+        sal = q.norm(dim=-1).mean(-1)    # [B,N,4]
+        # add HP bias
+        if hp_child is not None and self.alpha != 0.0:
+            sal = sal + self.alpha * hp_child
+
+        # top-k children
+        _, topk_idx = sal.topk(self.k, dim=2)  # [B,N,k]
+
+        def gather_kept(t):
+            t_flat = t.flatten(-2)             # [B,N,4,H*dh]
+            idx_exp = topk_idx.unsqueeze(-1).expand(-1,-1,-1,H*dh)
+            kept = torch.gather(t_flat, 2, idx_exp)
+            return kept.view(B, N, self.k, H, dh)
+
+        k_kept, v_kept = gather_kept(k), gather_kept(v)
+
+        # parent attends to kept children
+        q_parent = q.mean(2)                    # [B,N,H,dh]
+        scale = 1.0 / math.sqrt(dh)
+        att = (q_parent.unsqueeze(2) * k_kept).sum(-1) * scale  # [B,N,k,H]
+        w = att.softmax(2)
+        o_parent = (w.unsqueeze(-1) * v_kept).sum(2)            # [B,N,H,dh]
+        o_parent = o_parent.transpose(2,3).reshape(B, N, D)
+        o_parent = self.proj(o_parent)
+
+        # CiF fusion (gate)
+        gate = torch.sigmoid(self.cif_proj(x_grp.reshape(-1, D))).view(B, N, C, D)
+        x_grp = x_grp + gate * o_parent.unsqueeze(2)
+        return o_parent, x_grp
+
+# --------------------- MODEL: Fixed quadtree + MX-CiF + HP guidance ----------------
+class BottomUpFixedQT_HPGuided(nn.Module):
+    """
+    Fixed 2x2 sibling groups (exactly like your friend),
+    but:
+      - HP-guided top-k inside each group
+      - HP-biased parent-group pooling at the end
+    Expects per-image hp patch map (196,) from precompute.
+    """
+    def __init__(self, d_model=768, heads=12, k_keep=2, alpha_topk=ALPHA_TOPK, beta_pool=BETA_POOL):
+        super().__init__()
+        vit = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=0)
+        self.patch     = vit.patch_embed
+        self.cls_token = nn.Parameter(torch.zeros(1,1,d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1,1+14*14,d_model))  # 196+1
+        # fixed buffers
+        idx, msk = build_sibling_buffers(14, 14)
+        self.register_buffer('sib_idx', idx)  # [L, Nmax, 4]
+        self.register_buffer('sib_msk', msk)  # [L, Nmax]
+        self.level_attn  = nn.ModuleList([
+            MxCIFSiblingAttentionHP(d_model, heads, k_keep, alpha_topk)
+            for _ in range(idx.size(0))
+        ])
+        self.parent_gate = nn.Linear(d_model,1,bias=True)
+        self.layer_norm  = nn.LayerNorm(d_model)
+        self.temperature = 1.0
+        self.head        = nn.Linear(d_model,1)
+        self.beta_pool   = beta_pool
+
+    def forward(self, imgs, stems):
+        """
+        imgs: [B, 3, 224, 224]
+        stems: list[str] image stems for loading hp maps
+        """
+        B = imgs.size(0)
+        x = self.patch(imgs)  # [B, 196, D]
+        x = torch.cat([self.cls_token.expand(B,-1,-1), x],1) + self.pos_embed
+        x = x[:,1:]  # [B,196,D], drop CLS
+        dev = imgs.device
+
+        # Load per-image HP (flatten 196), stack to [B,196]
+        hp_list = []
+        for s in stems:
+            hp = torch.load(os.path.join(HP_DIR, s + ".pt"), map_location='cpu')  # (196,)
+            hp_list.append(hp)
+        hp_batch = torch.stack(hp_list, dim=0).to(dev)  # [B,196], 0..1
+
+        parent_bank = []      # list of [B,n,D] across levels (concat dim=1)
+        parent_hp   = []      # list of [B,n]   (avg hp per group) for pooling bias
+
+        for l, attn in enumerate(self.level_attn):
+            n = int(self.sib_msk[l].sum().item())
+            if n == 0:
+                continue
+            idx = self.sib_idx[l, :n].to(dev)             # [n,4]
+            # Gather child tokens: [B,196,D] -> [B,n,4,D]
+            flat_idx = idx.reshape(-1)
+            sel = x.index_select(dim=1, index=flat_idx)   # [B, n*4, D]
+            child = sel.view(B, n, 4, x.size(-1))         # [B, n, 4, D]
+
+            # Gather child HP in same way: [B,196] -> [B,n,4]
+            hp_sel = hp_batch.index_select(dim=1, index=flat_idx).view(B, n, 4)
+
+            o_parent, x_grp = attn(child, hp_sel)
+
+            # LayerNorm over D (on children group)
+            B2, n2, C2, D2 = x_grp.shape
+            x_grp = self.layer_norm(x_grp.reshape(-1, D2)).view(B2, n2, C2, D2)
+
+            # per-group feature (mean over 4 children) & HP score
+            parent_bank.append(x_grp.mean(2))  # [B,n,D]
+            parent_hp.append(hp_sel.mean(2))   # [B,n]
+            # feed up
+            x = o_parent                       # [B, n, D]
+
+        # concat all levels along group dimension: feats [B, T, D], hp_scores [B, T]
+        feats = torch.cat(parent_bank, dim=1) if parent_bank else x  # [B,T,D]
+        hp_scores = torch.cat(parent_hp, dim=1) if parent_hp else torch.zeros((B,0), device=dev)
+
+        # gating logits + HP bias
+        logits = self.parent_gate(feats).squeeze(-1)  # [B,T]
+        if hp_scores.numel() > 0 and self.beta_pool != 0.0:
+            logits = logits + self.beta_pool * hp_scores
+
+        # softmax pooling
+        weights = torch.softmax(logits / self.temperature, dim=1)     # [B,T]
+        gated   = (weights.unsqueeze(-1) * feats).sum(1)              # [B,D]
+        root    = gated + 0.1 * feats.mean(1)                         # residual
+
+        return self.head(root).squeeze(-1)                            # [B]
+
+# --------------------------- Training utils --------------------------
+def run_epoch_with_names(model, dl, opt, crit, train=True, device='cuda', name="model"):
+    model.train() if train else model.eval()
+    tot_loss = tot_acc = tot = 0
+    t0 = time.time()
+    for b_idx, batch in enumerate(dl, 1):
+        x, y, stems = batch
+        x = x.to(device); y = y.to(device).float()
+        if train:
+            opt.zero_grad(set_to_none=True)
+            logits = model(x, list(stems)).squeeze(-1)
+            loss   = crit(logits, y)
+            loss.backward()
+            opt.step()
+        else:
+            with torch.no_grad():
+                logits = model(x, list(stems)).squeeze(-1)
+                loss   = crit(logits, y)
+        tot_loss  += loss.item() * y.size(0)
+        tot_acc   += ((logits>0).long()==y.long()).sum().item()
+        tot       += y.size(0)
+
+        if LOG_TRAIN_EVERY and (b_idx % LOG_TRAIN_EVERY == 0 or b_idx == len(dl)):
+            print(f"[{name}][{'train' if train else 'val'}] "
+                  f"batch {b_idx}/{len(dl)} | "
+                  f"loss {tot_loss/tot:.4f} | acc {tot_acc/tot:.4f} | {gpu_mem()}")
+            sys.stdout.flush()
+    return tot_loss/tot, tot_acc/tot, time.time()-t0
+
+# Wrap ViT so it accepts (x, stems) and ignores stems (to reuse the same runner)
+class VitAdapter(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, x, _stems=None):
+        return self.model(x)
+
+# --------------------------- Build data loaders -----------------------
+train_dl, val_dl = build_dataloaders_on_the_fly(DATA_SRC, bs=BATCH_SIZE, val_pct=VAL_PCT)
+print(f"[Data] Train batches: {len(train_dl)} | Val batches: {len(val_dl)} | batch_size={BATCH_SIZE}")
+
+# ------------------------------- Models -------------------------------
+model_qt  = BottomUpFixedQT_HPGuided().to(device)
+model_vit = VitAdapter(timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=1)).to(device)
+
+opt_qt  = torch.optim.AdamW(model_qt.parameters(),  lr=LR)
+opt_vit = torch.optim.AdamW(model_vit.parameters(), lr=LR)
+crit = nn.BCEWithLogitsLoss()
+
+# Warm-up
+print("\n[Warmup] Running one forward pass on each model…")
+xb,yb,stems = next(iter(train_dl))
+_ = model_qt(xb.to(device), list(stems))
+_ = model_vit(xb.to(device), list(stems))
+print(f"[Warmup] OK. {gpu_mem()}")
+
+# ------------------------------ TRAIN --------------------------------
+total_start = time.time()
+for model, opt, name in [(model_qt, opt_qt, 'MX-CiF-QT+HP'),
+                         (model_vit, opt_vit, 'Baseline-ViT')]:
+    print(f"\n=== {name} Training ===")
+    start = time.time()
+    for ep in range(1, EPOCHS+1):
+        ep_start = time.time()
+        tl, ta, tt = run_epoch_with_names(model, train_dl, opt, crit, True,  device, name=name)
+        vl, va, vt = run_epoch_with_names(model, val_dl,   opt, crit, False, device, name=name)
+        ep_time = time.time() - ep_start
+        print(f"{name} E{ep:02d} | {ep_time:5.1f}s "
+              f"| train loss {tl:.4f} acc {ta:.4f} (t={tt:.1f}s) "
+              f"| val loss {vl:.4f} acc {va:.4f} (t={vt:.1f}s)")
+        sys.stdout.flush()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+    elapsed = time.time() - start
+    print(f"{name} total time: {elapsed:.1f}s")
+total_elapsed = time.time() - total_start
+print(f"\nAll models total time: {total_elapsed:.1f}s | {gpu_mem()}")
