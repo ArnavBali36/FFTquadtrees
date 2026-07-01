@@ -1,0 +1,9 @@
+torch>=2.0
+timm>=0.9
+numpy>=1.23
+opencv-python>=4.5
+Pillow>=9.0
+torchvision>=0.15
+scikit-learn>=1.0
+# Optional, only needed to load the Hugging Face IllusionAnimals dataset:
+# datasets>=2.19
